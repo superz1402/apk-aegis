@@ -1,0 +1,97 @@
+name: apk-aegis-audit
+# AEGIS audit pipeline — copy into the target Android repo's .github/workflows/
+# Jobs: build+test+lint, dependency audit, secret scan, MobSF static audit.
+
+on:
+  pull_request:
+  push:
+    tags: ['v*']
+
+jobs:
+  build-test-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build (audit artifact)
+        run: ./gradlew assembleRelease --stacktrace
+      - name: Unit tests
+        run: ./gradlew testReleaseUnitTest --stacktrace
+      - name: Lint
+        run: ./gradlew lint
+      - name: Upload artifact for audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apk
+          path: '**/build/outputs/apk/release/*.apk'
+          if-no-files-found: warn
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: OWASP dependency-check
+        # NVD_API_KEY repo secret recommended (NVD rate limits anonymous use)
+        run: ./gradlew dependencyCheckAnalyze || true
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: '**/build/reports/dependency-check-report.html'
+          if-no-files-found: ignore
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history: leaks live in history, not just HEAD
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  mobsf-audit:
+    needs: build-test-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-apk
+      - name: Find APK
+        id: apk
+        run: echo "path=$(find . -name '*.apk' | head -1)" >> "$GITHUB_OUTPUT"
+      - name: Start MobSF
+        run: |
+          docker run -d --name mobsf -p 8000:8000 opensecurity/mobile-security-framework-mobsf:latest
+          for i in $(seq 1 30); do curl -sf http://localhost:8000/ && break; sleep 2; done
+      - name: Static scan
+        run: |
+          curl -sf -F "file=@${{ steps.apk.outputs.path }}" \
+            -H "Authorization: ${{ secrets.MOBSF_API_KEY }}" \
+            http://localhost:8000/api/v1/upload -o upload.json
+          HASH=$(python3 -c "import json;print(json.load(open('upload.json'))['hash'])")
+          curl -sf -X POST -H "Authorization: ${{ secrets.MOBSF_API_KEY }}" \
+            "http://localhost:8000/api/v1/static_scan" \
+            -F "hash=$HASH" -o scan.json
+          sleep 20
+          curl -sf -X POST -H "Authorization: ${{ secrets.MOBSF_API_KEY }}" \
+            "http://localhost:8000/api/v1/static_analysis_json" \
+            -F "hash=$HASH" -o mobsf_report.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mobsf-report
+          path: mobsf_report.json
+      # AEGIS rule: MobSF is layer 1. Triage every finding; the SKILL.md
+      # manual pass (TrustManager overrides, WebView judgment, business logic)
+      # is layer 2 and not optional.
